@@ -14,8 +14,11 @@ conda create -n your_conda_envir_name python=3.10 -y
 conda activate your_conda_envir_name
 ```
 ```shell
-pip install requirments.txt
+pip install -r requirements.txt
 ```
+
+
+
 ## Modify Configuration
 Open `.env`file and modify the following values
 ```shell
