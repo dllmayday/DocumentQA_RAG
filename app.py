@@ -14,10 +14,8 @@ from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import HTMLResponse, StreamingResponse
-from fastapi.staticfiles import StaticFiles
-from fastapi.templating import Jinja2Templates
 from pydantic import BaseModel
-from sse_starlette.sse import EventSourceResponse
+import os
 
 # 延迟导入 RAG 模块
 RAG_pipeline = None
@@ -52,9 +50,6 @@ app = FastAPI(
     version="1.0.0",
     lifespan=lifespan
 )
-
-# 配置模板和静态文件
-templates = Jinja2Templates(directory="templates")
 
 # ------------ Pydantic Models -----------
 class ChatRequest(BaseModel):
@@ -112,12 +107,12 @@ async def chat(request: ChatRequest):
 @app.get("/api/chat/stream")
 async def chat_stream(query: str):
     """
-    流式聊天接口 (SSE)
+    流式聊天接口 (纯文本流)
     """
     if not query.strip():
         raise HTTPException(status_code=400, detail="查询内容不能为空")
     
-    async def event_generator() -> AsyncGenerator[dict, None]:
+    async def generate():
         try:
             _import_rag_modules()
             embeddings = get_embeddings_model()
@@ -131,28 +126,15 @@ async def chat_stream(query: str):
             
             # 流式生成响应
             for chunk in rag.build_prompt_get_answer(context_docs, stream=True):
-                yield {
-                    "event": "message",
-                    "data": chunk
-                }
+                yield chunk
             
-            # 结束信号
-            yield {
-                "event": "done",
-                "data": ""
-            }
+            #yield "[DONE]"
         except ImportError as e:
-            yield {
-                "event": "error",
-                "data": f"缺少依赖: {e}"
-            }
+            yield f"错误: 缺少依赖 - {e}"
         except Exception as e:
-            yield {
-                "event": "error",
-                "data": str(e)
-            }
+            yield f"错误: {str(e)}"
     
-    return EventSourceResponse(event_generator())
+    return StreamingResponse(generate(), media_type="text/plain")
 
 def _get_context_for_query(rag: RAG_pipeline, query: str) -> List[str]:
     """
