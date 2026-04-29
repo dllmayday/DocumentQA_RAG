@@ -14,7 +14,7 @@ conda create -n your_conda_envir_name python=3.10 -y
 conda activate your_conda_envir_name
 ```
 ```shell
-pip install -r requirements.txt
+pip install  requirements.txt
 ```
 
 
