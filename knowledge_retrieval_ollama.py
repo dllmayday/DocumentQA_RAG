@@ -1,275 +1,208 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
-"""
--------------------------------------------------
-   @File Name:     knowledge_retrieval_ollama.py
-   @Author:        Luyao.zhang
-   @Date:          2023/12/29
-   @Description:   RAG retrieval with Ollama local models
--------------------------------------------------
-"""
+
 import os
-from dotenv import load_dotenv
-from typing import List
-from langchain_milvus import Milvus
-from pymilvus import connections, Collection
+from typing import List, Set
+
+from pymilvus import connections, Collection, utility
+from langchain_ollama import OllamaEmbeddings, ChatOllama
 from langchain_core.prompts import ChatPromptTemplate
-from langchain_core.output_parsers import StrOutputParser
-from langchain_community.embeddings import OllamaEmbeddings
-from langchain_community.chat_models import ChatOllama
 
-load_dotenv(".env")
-
-# ------------ Ollama Configuration -----------
+MILVUS_DB_PATH = "./milvus.db"
 OLLAMA_BASE_URL = "http://localhost:11434"
 
-def get_embeddings_model(model: str = "nomic-embed-text"):
-    """获取 Ollama 嵌入模型"""
-    return OllamaEmbeddings(model=model, base_url=OLLAMA_BASE_URL)
 
-def get_chat_model(model: str = "qwen2.5:0.5b"):
-    """获取 Ollama 聊天模型"""
-    return ChatOllama(
-        model=model,
-        base_url=OLLAMA_BASE_URL,
-        temperature=0.1
+# =====================
+# Milvus connect
+# =====================
+def connect_milvus():
+    connections.connect(
+        alias="default",
+        uri=os.path.abspath(MILVUS_DB_PATH)
     )
 
-# ------------ Milvus -----------
-# Use Milvus Lite (local file-based)
-milvus_db_path = os.environ.get("MILVUS_DB_PATH", "./milvus.db")
-connection_args = {"uri": milvus_db_path}
+
+# =====================
+# Models（只初始化一次）
+# =====================
+_emb = None
+_llm = None
 
 
-class RAG_pipeline(object):
-    """
-    构建RAG Pipeline (Ollama Version)
-    """
+def get_embeddings():
+    global _emb
+    if _emb is None:
+        _emb = OllamaEmbeddings(
+            model="nomic-embed-text",
+            base_url=OLLAMA_BASE_URL
+        )
+    return _emb
 
-    def __init__(self, milvus_connection_args, embeddings_model, query: str):
-        """
-        Args:
-            milvus_connection_args: milvus连接信息
-            embeddings_model: text嵌入模型
-            query: 用户输入的请求
-        """
-        self.milvus_connection_args = milvus_connection_args
-        self.embeddings_model = embeddings_model
+
+def get_llm():
+    global _llm
+    if _llm is None:
+        _llm = ChatOllama(
+            model="qwen2.5:0.5b",
+            base_url=OLLAMA_BASE_URL
+        )
+    return _llm
+
+
+# =====================
+# Collection cache（关键优化）
+# =====================
+_collection_cache = {}
+
+
+def get_collection(name: str):
+    if name in _collection_cache:
+        return _collection_cache[name]
+
+    col = Collection(name, using="default")
+    col.load()
+
+    _collection_cache[name] = col
+    return col
+
+
+# =====================
+# Vector search
+# =====================
+def search(col_name: str, query_vec, k=5):
+
+    col = get_collection(col_name)
+
+    res = col.search(
+        data=[query_vec],
+        anns_field="embedding",
+        param={
+            "metric_type": "COSINE",
+            "params": {"ef": 128}   # ✔ 比 64 更稳
+        },
+        limit=k,
+        output_fields=["doc_id", "text"]
+    )
+
+    doc_ids, texts = [], []
+
+    for hit in res[0]:
+        doc_ids.append(hit.entity.get("doc_id"))
+        texts.append(hit.entity.get("text"))
+
+    return doc_ids, texts
+
+
+# =====================
+# RAG pipeline
+# =====================
+class RAGPipeline:
+
+    def __init__(self, query: str):
         self.query = query
+        self.emb = get_embeddings()
+        self.llm = get_llm()
 
-    def _ensure_connection(self):
-        """确保 Milvus 连接"""
-        try:
-            connections.connect(**self.milvus_connection_args)
-        except:
-            pass
+    # ---------------------
+    # child retrieval
+    # ---------------------
+    def child_retriever(self) -> Set[str]:
+        qv = self.emb.embed_query(self.query)
+        ids, _ = search("child_chunk", qv)
+        return set(ids)
 
-    def child_chunk_retriever(
-            self,
-            child_collection_name: str = "child_chunk"):
-        """
-        对child_chunk设置检索器retriever
-        Returns:
-            doc_id组成的列表
-        """
-        self._ensure_connection()
-        
-        # 构建用于索引child chunk的向量数据库
-        vectorstore = Milvus(
-            connection_args=self.milvus_connection_args,
-            collection_name=child_collection_name,
-            embedding_function=self.embeddings_model,
-            enable_dynamic_field=True,
-        )
+    # ---------------------
+    # parent retrieval
+    # ---------------------
+    def get_parent(self, doc_ids: List[str]):
 
-        # Vectorstore retrieves the child chunks
-        child_chunk_res = vectorstore.similarity_search(
-            query=self.query, k=3)
-        
-        # 只返回doc_id组成的列表
-        res_id_list = []
-        for single_res in child_chunk_res:
-            if "doc_id" in single_res.metadata:
-                res_id_list.append(single_res.metadata["doc_id"])
-        return res_id_list
+        col = get_collection("parent_chunk")
 
-    def summary_retriever(
-            self,
-            summary_collection_name: str = "summary"):
-        """
-        对summary_chunk设置检索器retriever
-        Returns:
-            doc_id组成的列表
-        """
-        self._ensure_connection()
-        
-        # 构建用于索引summary的向量数据库
-        vectorstore = Milvus(
-            connection_args=self.milvus_connection_args,
-            collection_name=summary_collection_name,
-            embedding_function=self.embeddings_model,
-            enable_dynamic_field=True,
-        )
+        out = []
 
-        # Vectorstore retrieves the summary chunks
-        summary_chunk_res = vectorstore.similarity_search(
-            query=self.query, k=3)
-        
-        # 只返回doc_id组成的列表
-        res_id_list = []
-        for single_res in summary_chunk_res:
-            if "doc_id" in single_res.metadata:
-                res_id_list.append(single_res.metadata["doc_id"])
-        return res_id_list
-
-    def hypothetical_retriever(
-            self,
-            hypothetical_query_collection="hypothetical_query"
-    ):
-        """
-        对hypothetical_query设置检索器retriever
-        Returns:
-            doc_id组成的列表
-        """
-        self._ensure_connection()
-        
-        try:
-            vectorstore = Milvus(
-                connection_args=self.milvus_connection_args,
-                collection_name=hypothetical_query_collection,
-                embedding_function=self.embeddings_model,
-                enable_dynamic_field=True,
+        for did in doc_ids:
+            res = col.query(
+                expr=f'doc_id == "{did}"',
+                output_fields=["text"]
             )
-            
-            hypo_res = vectorstore.similarity_search(
-                query=self.query, k=3)
-            
-            res_id_list = []
-            for single_res in hypo_res:
-                if "doc_id" in single_res.metadata:
-                    res_id_list.append(single_res.metadata["doc_id"])
-            return res_id_list
-        except Exception as e:
-            print(f"Warning: hypothetical_query collection not available: {e}")
-            return []
+            if res:
+                out.append(res[0]["text"])
 
-    def get_parent_document(
-            self,
-            doc_id_list: List[str],
-            parent_chunk: str = "parent_chunk"):
-        """
-        根据doc_id列表从parent_chunk集合中获取完整的文档内容
-        """
-        self._ensure_connection()
-        
-        # Use pymilvus directly with URI for Milvus Lite
-        uri = self.milvus_connection_args.get("uri", "./milvus.db")
-        connections.connect(uri=uri)
-        collection = Collection(name=parent_chunk)
-        collection.load()
-        
-        parent_chunk_list = []
-        for doc_id in doc_id_list:
-            # 向量查询
-            try:
-                retrieved_res = collection.query(
-                    expr=f"doc_id in ['{doc_id}']",
-                    offset=0,
-                    limit=10,
-                    output_fields=["text", "page_content"],
-                    consistency_level="Strong"
-                )
-                if retrieved_res:
-                    # 尝试获取文本内容
-                    text = retrieved_res[0].get("text") or retrieved_res[0].get("page_content", "")
-                    parent_chunk_list.append(text)
-            except Exception as e:
-                print(f"Warning: Failed to retrieve doc_id {doc_id}: {e}")
-                continue
+        return out
 
-        return parent_chunk_list
+    # ---------------------
+    # LLM answer
+    # ---------------------
+    def ask_llm(self, docs: List[str]):
 
-    def build_prompt_get_answer(self, docs: List[str], stream=True):
-        """
-        构建prompt并返回LLM的答案
-        """
-        template = """
-        你是一个文档问答机器人，请仅仅根据下面指定文档列表中的多个文档来回答提出的问题，不能依赖自己的任何先验知识，如果在指定的文档中没有找到问题的答案，
-        请回答:'抱歉，本地知识库中暂无该问题相关的信息。'
-        {context}
-        问题：{question}
-        """
-        prompt = ChatPromptTemplate.from_template(template)
-        model = get_chat_model()
-        
-        if stream:
-            llm_chain = prompt | model
-            answer = llm_chain.stream(
-                {"question": self.query, "context": docs})
-            for ret in answer:
-                yield ret.content
-        else:
-            chain = prompt | model
-            answer = chain.invoke({"question": self.query, "context": docs})
-            return answer
+        prompt = ChatPromptTemplate.from_template("""
+你是一个严谨的文档问答助手。
 
-    def build_rag(self, stream=True):
-        """
-        构建RAG Pipeline
-        Returns:
-        """
-        child_list = self.child_chunk_retriever()
-        summary_list = self.summary_retriever()
-        hypo_list = self.hypothetical_retriever()
-        
-        # 取交集（优先使用多个检索结果的交集）
-        if child_list and summary_list:
-            intersection_list = list(set(child_list) & set(summary_list))
-            if intersection_list:
-                doc_id_list = intersection_list
-            else:
-                # 如果没有交集，使用child_list
-                doc_id_list = child_list
-        else:
-            doc_id_list = child_list if child_list else summary_list
-        
-        # 如果hypo_list有结果，也加入考虑
-        if hypo_list:
-            doc_id_list = list(set(doc_id_list) | set(hypo_list))
-        
-        parent_chunk_list = self.get_parent_document(doc_id_list)
-        
-        if stream:
-            stream_res = self.build_prompt_get_answer(
-                parent_chunk_list, stream=stream)
-            for res in stream_res:
-                print(res, end="", flush=True)
-        else:
-            answer = self.build_prompt_get_answer(
-                parent_chunk_list, stream=stream)
-            return answer
+只能使用以下文档回答问题：
 
+{context}
 
-def main():
-    while True:
-        input_prompt = "\n请输入内容（输入 'exit' 退出程序）: "
-        query = input(input_prompt)
-        if query.lower() == "exit":
-            print("程序退出。")
-            break
-        
-        # 使用 Ollama 本地模型
-        embeddings = get_embeddings_model()
-        rag = RAG_pipeline(
-            milvus_connection_args=connection_args,
-            embeddings_model=embeddings,
-            query=query
+问题：
+{question}
+
+如果没有答案，请回答：
+“抱歉，本地知识库中暂无该问题相关的信息。”
+""")
+        chain = prompt | self.llm
+
+        # ✅ 渲染查看最终 prompt
+        formatted = prompt.format_messages(
+            context="\n\n".join(docs),
+            question=self.query
         )
-        print("\n回答: ", end="")
-        rag.build_rag(stream=True)
-        print()  # 换行
-        print("\nUsing Ollama local models")
+        print(formatted)   # ← 这里会显示完整填充后的消息
+
+        return chain.invoke({
+            "context": "\n\n".join(docs),
+            "question": self.query
+        }).content
+
+    # ---------------------
+    # main pipeline
+    # ---------------------
+    def run(self):
+
+        print("▶ search child")
+
+        child_ids = self.child_retriever()
+
+        # ✔ fallback（避免空结果）
+        if not child_ids:
+            print("⚠ child empty fallback")
+            child_ids = set()
+
+        print("▶ fetch parent")
+
+        docs = self.get_parent(list(child_ids))
+
+        if not docs:
+            return "抱歉，本地知识库中暂无该问题相关的信息。"
+
+        print("▶ LLM")
+
+        return self.ask_llm(docs)
 
 
-if __name__ == '__main__':
+# =====================
+# CLI
+# =====================
+def main():
+
+    connect_milvus()
+
+    while True:
+        q = input("Q: ").strip()
+        if q.lower() == "exit":
+            break
+
+        rag = RAGPipeline(q)
+        print("\n" + rag.run() + "\n")
+
+
+if __name__ == "__main__":
     main()
